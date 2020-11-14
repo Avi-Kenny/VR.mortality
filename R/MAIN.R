@@ -9,14 +9,27 @@
 ################.
 
 # The "Setup" sections create and save the following objects:
-#   obj_name: obj description
-#   obj_name: obj description
-#   obj_name: obj description
+#   geo2: Ecuador GIS spatial dataframe
+#   mat: Adjacency matrix for Ecuador admin-1
+#   reg_names: Vector of Ecuador admin-1 names
+#   fbh: Raw data from Ecuador ENSANUT survey (from Wakefield Quito workshop)
+#   design: Design object for Ecuador ENSANUT survey
+#   years_3: Vector of three-year block names
+#   region_data: Dataframe to store both VR and SVY data; one row per
+#                region-time unit (time is 3 year blocks)
+#   national_data: Like region_data but aggregated nationally
+#   region_data_trans: Same as region_data but with different data sources in
+#                      different rows
+#   national_data_trans: Like region_data_trans but aggregated nationally
+#   region_data_trans_svy: region_data_trans filtered to only SVY data
+#   region_data_trans_vr: region_data_trans filtered to only VR data
 
 # List of data objects
-robjs <- c("national_data", "national_data_trans", "region_data",
-           "region_data_trans", "region_data_trans_svy",
-           "region_data_trans_vr", "mat", "years_3", "geo2", "reg_names")
+robjs <- c(
+  "geo2", "mat", "reg_names", "fbh", "design", "years_3", "region_data",
+  "national_data", "region_data_trans", "national_data_trans",
+  "region_data_trans_svy", "region_data_trans_vr"
+)
 
 
 
@@ -51,18 +64,19 @@ if (Sys.getenv("USERDOMAIN")=="AVI-KENNY-T460") {
   library(rstan)
   library(raster)
   library(parallel)
+  library(ggpubr)
 }
 
 # Load functions
 {
-  # source("my_func.R")
+  source("plot_map.R")
 }
 
 # Set code blocks to run
 {
   run_setup_data <- FALSE
   run_load_data <- TRUE
-  run_visualizations <- TRUE
+  run_visualizations <- FALSE
   run_analysis <- FALSE
 }
 
@@ -89,9 +103,13 @@ if (run_setup_data) {
   nb.r <- poly2nb(geo, queen=F, row.names = geo$NAME_1)
   mat <- nb2mat(nb.r, style="B",zero.policy=TRUE)
   mat <- as.matrix(mat[1:dim(mat)[1], 1:dim(mat)[1]])
+  rm(nb.r)
   
   # Save region names
   reg_names = rownames(mat)
+  
+  # Remove temporary objects
+  rm(geo)
   
 }
 
@@ -102,7 +120,6 @@ if (run_setup_data) {
 ###################################################.
 
 # Source: faculty.washington.edu/jonno/UNICEF-WORKSHOPS/ensanut2012fbh.csv
-# !!!!! Quality-check the entire data importing process
 
 if (run_setup_data) {
   fbh <- read_csv("../data/Quito workshop/ensanut2012fbh.csv")
@@ -140,17 +157,17 @@ if (run_setup_data) {
     
   }
   
-  # Parse VR data into a single data frame
+  # Temporary dataframe for holding VR data
   df_VR <- data.frame(
     "region" = character(),
-    "year" = integer(),
+    "years" = integer(),
     "births" = integer(),
     "deaths" = integer(),
     stringsAsFactors=FALSE
   )
   
   # Set up regions_vr list
-  # Note this is ONLY used for importing data; use `reg_names` for IDs
+  # Note this is ONLY used for importing data; use `reg_names` instead
   regions_vr = list(
     "01" = "Azuay",
     "02" = "Bolivar",
@@ -211,7 +228,7 @@ if (run_setup_data) {
         filter(as.numeric(PROVF) == as.numeric(region_code)) %>%
         nrow()
       df_VR[i,"region"] = region_name
-      df_VR[i,"year"] = year
+      df_VR[i,"years"] = year
       df_VR[i,"births"] = births
       df_VR[i,"deaths"] = deaths
       
@@ -225,7 +242,7 @@ if (run_setup_data) {
   # Add VR data to df_VR
   for (i in 1993:2010) {
     
-    df_VR = update_df_VR(
+    df_VR <- update_df_VR(
       i,
       df_VR,
       eval(parse(text=paste0("births_",i))),
@@ -236,16 +253,16 @@ if (run_setup_data) {
   
   # Aggregate VR regional deaths to three-year blocks
   df_VR %<>% mutate(
-    year = case_when(
-      between(year, 1993, 1995) ~ "93-95",
-      between(year, 1996, 1998) ~ "96-98",
-      between(year, 1999, 2001) ~ "99-01",
-      between(year, 2002, 2004) ~ "02-04",
-      between(year, 2005, 2007) ~ "05-07",
-      between(year, 2008, 2010) ~ "08-10",
+    years = case_when(
+      between(years, 1993, 1995) ~ "93-95",
+      between(years, 1996, 1998) ~ "96-98",
+      between(years, 1999, 2001) ~ "99-01",
+      between(years, 2002, 2004) ~ "02-04",
+      between(years, 2005, 2007) ~ "05-07",
+      between(years, 2008, 2010) ~ "08-10",
       TRUE ~ "error"
     )
-  ) %>% group_by(region, year) %>% summarize(
+  ) %>% group_by(region, years) %>% summarize(
     births = sum(births),
     deaths = sum(deaths)
   )
@@ -297,7 +314,6 @@ if (run_setup_data) {
   )
   
   # Set survey design
-  # !!!!! double-check this
   design <- svydesign(
     ids = ~V021,
     weights = ~V005,
@@ -306,22 +322,23 @@ if (run_setup_data) {
   )
   
   # Calculate direct counts of births and deaths
+  # Temporary objects; data is merged into region_data
   direct_births <- svyby(
     formula = ~birth,
     by = ~province+dob_years,
     design = design,
     FUN = svytotal
-  )
+  ) %>% mutate(var=se^2)
   direct_deaths <- svyby(
     formula = ~u5_death,
     by = ~province+dod_years,
     design = design,
     FUN = svytotal
-  )
+  ) %>% mutate(var=se^2)
   
   # Code below adapted from Wakefield Quito workshop code
   
-  # Region-level estimates
+  # Region-level estimates (temporary object)
   births_3_years <- getBirths(
     data = fbh,
     surveyyear = 2012,
@@ -333,7 +350,11 @@ if (run_setup_data) {
     date.interview = "V008",
     year.cut = seq(1993, 2011, by = 3)
   )
+  
+  # Vector of 3-year block labels
   years_3 <- levels(births_3_years$time)
+  
+  # Temporary dataframe for survey data (regional)
   df_survey <- getDirect(
     births = births_3_years,
     years = years_3,
@@ -346,7 +367,7 @@ if (run_setup_data) {
     national.only = FALSE
   )
   
-  # National estimates
+  # Temporary dataframe for survey data (national)
   df_survey_national <- getDirect(
     births = births_3_years,
     years = years_3,
@@ -359,6 +380,9 @@ if (run_setup_data) {
     national.only = TRUE
   )
   
+  # Remove temporary objcets
+  rm(births_3_years)
+  
 }
 
 
@@ -368,12 +392,8 @@ if (run_setup_data) {
 #################################################.
 
 # Uses `df_survey` object and `df_VR` objects generated above
-# !!!!! Import standard errors
 
 if (run_setup_data) {
-  
-  # Set up variables
-  years = df_VR$year %>% unique()
   
   # Set up data frames
   region_data <- data.frame(
@@ -384,74 +404,98 @@ if (run_setup_data) {
     "n_deaths_vr" = integer(),
     "n_births_svy" = integer(),
     "n_deaths_svy" = integer(),
+    "se_n_births_svy" = double(),
+    "se_n_deaths_svy" = double(),
     "u5mr_svy" = double(),
+    "se_logit_u5mr_svy" = double(),
     stringsAsFactors=FALSE
   )
   national_data <- df_survey_national %>%
-    subset(select=c(years,mean)) %>%
+    mutate(se_logit_u5mr_svy=sqrt(var.est)) %>%
+    subset(select=c(years,mean,se_logit_u5mr_svy)) %>%
     rename("u5mr_svy"=`mean`) %>%
-    mutate("u5mr_vr"=NA)
-  
+    mutate(u5mr_vr=NA, n_births_vr=NA, n_deaths_vr=NA,
+           n_births_svy=NA, n_deaths_svy=NA)
+
   # Fill national data frame
-  for (y in 1:length(years)) {
-    yr <- years[y]
-    d <- df_VR %>% filter(year==yr)
+  # !!!!! Calculations assume that counts of births/deaths are normally distributed, which is infeasible; this is a rough approximation
+  for (y in years_3) {
+    b_svy <- direct_births %>% filter(dob_years==y) %>% summarize(sum(birth))
+    d_svy <- direct_deaths %>% filter(dod_years==y) %>% summarize(sum(u5_death))
+    var_b_svy <- direct_births %>% filter(dob_years==y) %>% summarize(sum(var))
+    var_d_svy <- direct_deaths %>% filter(dod_years==y) %>% summarize(sum(var))
+    se_b_svy <- sqrt(var_b_svy)
+    se_d_svy <- sqrt(var_d_svy)
+    d <- df_VR %>% filter(years==y)
     u5mr <- round(sum(d$deaths)/sum(d$births),5)
+    b_vr <- sum(d$births)
+    d_vr <- sum(d$deaths)
     national_data %<>% mutate(
-      u5mr_vr = ifelse(years==yr, u5mr, u5mr_vr)
+      u5mr_vr = ifelse(years_3==y, u5mr, u5mr_vr),
+      n_births_vr = ifelse(years_3==y, as.numeric(b_vr), n_births_vr),
+      n_deaths_vr = ifelse(years_3==y, as.numeric(d_vr), n_deaths_vr),
+      n_births_svy = ifelse(years_3==y, as.numeric(round(b_svy)), n_births_svy),
+      n_deaths_svy = ifelse(years_3==y, as.numeric(round(d_svy)), n_deaths_svy),
+      se_n_births_svy = as.numeric(se_b_svy),
+      se_n_deaths_svy = as.numeric(se_d_svy)
     )
   }
   
   # Fill regional data frame
   for (r in 1:length(reg_names)) {
-    for (y in 1:length(years)) {
+    for (y in years_3) {
       
-      # Create alias for years
-      yrs <- years
-      
-      # Get n_births_vr
       n_births_vr <- df_VR %>%
-        filter(region==reg_names[[r]] &
-                 years==yrs[y]) %>%
+        filter(region==reg_names[[r]] & years==y) %>%
         subset(select=births) %>% as.numeric()
       
-      # Get n_deaths_vr
       n_deaths_vr <- df_VR %>%
-        filter(region==reg_names[[r]] &
-                 years==yrs[y]) %>%
+        filter(region==reg_names[[r]] & years==y) %>%
         subset(select=deaths) %>% as.numeric()
       
-      # Get n_births_svy
       n_births_svy <- direct_births %>%
-        filter(province==reg_names[[r]] & 
-                 dob_years==yrs[y]) %>%
-        subset(select=birth) %>% as.numeric() %>%
-        round()
-      
-      # Get n_deaths_svy
+        filter(province==reg_names[[r]] & dob_years==y) %>%
+        subset(select=birth) %>% as.numeric() %>% round()
+
       n_deaths_svy <- direct_deaths %>%
-        filter(province==reg_names[[r]] &
-                 dod_years==yrs[y]) %>%
-        subset(select=u5_death) %>% as.numeric() %>%
-        round()
+        filter(province==reg_names[[r]] & dod_years==y) %>%
+        subset(select=u5_death) %>% as.numeric() %>% round()
+
+      se_n_births_svy <- direct_births %>%
+        filter(province==reg_names[[r]] &  dob_years==y) %>%
+        subset(select=se) %>% as.numeric()
       
-      # Get u5mr_svy
+      se_n_deaths_svy <- direct_deaths %>%
+        filter(province==reg_names[[r]] & dod_years==y) %>%
+        subset(select=se) %>% as.numeric()
+
       u5mr_svy <- df_survey %>%
-        filter(region==reg_names[[r]] &
-                 years==yrs[y]) %>%
+        filter(region==reg_names[[r]] & years==y) %>%
         subset(select=mean) %>% as.numeric()
       
+      se_logit_u5mr_svy <- df_survey %>%
+        filter(region==reg_names[[r]] & years==y) %>%
+        subset(select=var.est) %>% sqrt() %>% as.numeric()
+
       # Add row to data frame
       region_data[nrow(region_data)+1,] <- list(
-        r, reg_names[r],
-        years[y], n_births_vr, n_deaths_vr,
-        n_births_svy, n_deaths_svy, u5mr_svy
+        r, reg_names[r], y, n_births_vr, n_deaths_vr, n_births_svy,
+        n_deaths_svy, se_n_births_svy, se_n_deaths_svy, u5mr_svy,
+        se_logit_u5mr_svy
       )
       
     }
   }
   
+  # Remove temporary objects
+  rm(direct_births)
+  rm(direct_deaths)
+  rm(df_survey)
+  rm(df_survey_national)
+  rm(df_VR)
+  
   # Remove one row with no survey deaths (Tungurahua 08-10)
+  # !!!!! Note: this causes totals to differ bw region_data and national_data
   region_data %<>% filter(!is.na(u5mr_svy))
   
   # Generate calculated variables
@@ -467,7 +511,9 @@ if (run_setup_data) {
       years=="08-10" ~ 6,
       TRUE ~ 999
     ),
-    log_mbias = log(u5mr_vr/u5mr_svy)
+    log_mbias = log(u5mr_vr/u5mr_svy),
+    mbias_b = n_births_vr/n_births_svy,
+    mbias_d = n_deaths_vr/n_deaths_svy
   )
   national_data %<>% mutate(
     time = case_when(
@@ -479,21 +525,25 @@ if (run_setup_data) {
       years=="08-10" ~ 6,
       TRUE ~ 999
     ),
-    log_mbias = log(u5mr_vr/u5mr_svy)
+    log_mbias = log(u5mr_vr/u5mr_svy),
+    mbias_b = n_births_vr/n_births_svy,
+    mbias_d = n_deaths_vr/n_deaths_svy
   )
   
   # Create transformed datasets
-  # Source: 0=VR, 1=survey
   region_data_trans <- sqldf(
-    "SELECT id_reg, region, years, time, 1 AS source,
+    "SELECT id_reg, region, years, time, 'Survey' AS source,
    n_births_svy AS n_births, n_deaths_svy AS n_deaths,
+   se_n_births_svy, se_n_deaths_svy, se_logit_u5mr_svy,
    u5mr_svy AS u5mr, log_mbias FROM region_data
    
-   UNION SELECT id_reg, region, years, time, 0,
-   n_births_vr, n_deaths_vr, u5mr_vr, NULL FROM region_data
+   UNION SELECT id_reg, region, years, time, 'VR',
+   n_births_vr, n_deaths_vr, 0, 0, 0,
+   u5mr_vr, NULL FROM region_data
    
    ORDER BY region, years, source"
   )
+  # !!!!! national_data_trans is currently very limited
   national_data_trans <- sqldf(
     "SELECT years, time, 'Survey' AS source, u5mr_svy AS u5mr,
    log_mbias FROM national_data
@@ -503,12 +553,6 @@ if (run_setup_data) {
    ORDER BY source, time"
   )
   
-  # Print data structure
-  head(region_data)
-  head(region_data_trans)
-  head(national_data)
-  head(national_data_trans)
-  
   # Create copies of id variables
   region_data_trans %<>% mutate(
     id_reg_copy = id_reg,
@@ -517,11 +561,11 @@ if (run_setup_data) {
   
   # Create filtered data sources
   region_data_trans_svy <- region_data_trans %>%
-    filter(source==0) %>%
+    filter(source=="Survey") %>%
     rowid_to_column("id_row")
   
   region_data_trans_vr <- region_data_trans %>%
-    filter(source==1) %>%
+    filter(source=="VR") %>%
     rowid_to_column("id_row")
   
 }
@@ -533,9 +577,9 @@ if (run_setup_data) {
 #################################################.
 
 if (run_setup_data) {
-  
+
   for (i in 1:length(robjs)) {
-    filename <- paste0("../robj/", robjs[i], ".robj")
+    filename <- paste0("../robj/", robjs[i], ".rds")
     saveRDS(eval(as.name(robjs[i])), filename)
   }
   
@@ -550,10 +594,58 @@ if (run_setup_data) {
 if (run_load_data) {
   
   for (i in 1:length(robjs)) {
-    filename <- paste0("../robj/", robjs[i], ".robj")
+    filename <- paste0("../robj/", robjs[i], ".rds")
     assign(robjs[i], readRDS(filename))
   }
   
+  # obj <- "design"
+  # assign(obj, readRDS(paste0("../robj/", obj, ".rds")))
+  
+}
+
+
+
+######################################.
+##### VISUAL: Birth/death counts #####
+######################################.
+
+if (run_visualizations) {
+
+  # for (reg in reg_names[1:3]) {
+  for (reg in reg_names) {
+    
+    df <- region_data_trans %>% filter(region==reg)
+    
+    p1 <- ggplot(df, aes(x=years, y=n_births, group=source, color=as.factor(source))) +
+      geom_line() + geom_point() +
+      geom_ribbon(
+        aes(ymin = n_births-(1.96*se_n_births_svy),
+            ymax = n_births+(1.96*se_n_births_svy),
+            fill = "95% CI",
+            color = "95% CI"),
+        alpha = 0.2,
+        color = NA
+      ) +
+      labs(title=paste("Region:",reg),x="Years",y="Births",color="Source",fill="")
+    
+    p2 <- ggplot(df, aes(x=years, y=n_deaths, group=source, color=as.factor(source))) +
+      geom_line() + geom_point() +
+      geom_ribbon(
+        aes(ymin = n_deaths-(1.96*se_n_deaths_svy),
+            ymax = n_deaths+(1.96*se_n_deaths_svy),
+            fill = "95% CI",
+            color = "95% CI"),
+        alpha = 0.2,
+        color = NA
+      ) +
+      labs(title=" ",x="Years",y="Deaths",color="Source")
+    
+    p <- ggarrange(p1, p2, common.legend=TRUE, legend="bottom")
+    
+    ggsave(paste0(reg,".png"), width=8, height=4)
+      
+  }
+
 }
 
 
@@ -565,6 +657,7 @@ if (run_load_data) {
 if (run_visualizations) {
   
   # Get survey 80% CIs
+  # !!!!! Should be pulling from another object; df_survey_national is temporary
   svy_ci_low <- expit(
     logit(df_survey_national$mean) +
       qnorm(0.1) * sqrt(df_survey_national$var.est)
@@ -575,6 +668,7 @@ if (run_visualizations) {
   )
   
   # Get VR counts
+  # !!!!! Use region_data (or one of its derivatives) instead of df_VR
   vr_births <- c()
   vr_deaths <- c()
   for (y in 1:length(years)) {
@@ -765,6 +859,113 @@ if (run_visualizations) {
       y = "log(MBIAS)",
       title = "log(MBIAS) vs. time, by region (sample)"
     )
+  
+}
+
+
+
+##################################################.
+##### VISUAL: MBIAS_b/MBIAS_d visualizations #####
+##################################################.
+
+if (run_visualizations) {
+  
+  # Line graph: MBIAS vs. time
+  # Export 600x400
+  national_data2 <- region_data %>% # !!!!! Move this to data processing phase
+    filter(n_births_vr!=0) %>%
+    group_by(time) %>%
+    summarize(
+      n_births_svy=sum(n_births_svy),
+      n_deaths_svy=sum(n_deaths_svy),
+      n_births_vr=sum(n_births_vr),
+      n_deaths_vr=sum(n_deaths_vr)
+    ) %>%
+    mutate(
+      mbias_b = n_births_vr/n_births_svy,
+      mbias_d = n_deaths_vr/n_deaths_svy
+    )
+  df <- data.frame(
+    time <- rep(1:6, 2),
+    mbias <- c(national_data2$mbias_b, national_data2$mbias_d),
+    # mbias <- c(national_data$mbias_b, national_data$mbias_d),
+    type <- rep(c("births","deaths"), each=6)
+  )
+  ggplot(df, aes(x=time, y=mbias, color=type)) + 
+    geom_line() +
+    scale_x_discrete(
+      limits = 1:6,
+      labels = years_3
+    ) +
+    labs(
+      x = "Time period",
+      y = "MBIAS",
+      title = "MBIAS vs. time"
+    )
+  
+  # Line graph: MBIAS_b vs. time
+  # Export 600x400
+  df <- region_data %>% filter(n_births_vr!=0)
+  ggplot(df, aes(x=time, y=mbias_b, color=region)) + 
+    geom_line() +
+    scale_x_discrete(
+      limits = 1:6,
+      labels = years_3
+    ) +
+    labs(
+      x = "Time period",
+      y = "MBIAS (births)",
+      title = "MBIAS (births) vs. time, by region"
+    ) +
+    theme(legend.position = "none")
+  
+  # Line graph: MBIAS_d vs. time
+  # Export 600x400
+  df <- region_data %>% filter(n_births_vr!=0)
+  ggplot(df, aes(x=time, y=mbias_d, color=region)) + 
+    geom_line() +
+    scale_x_discrete(
+      limits = 1:6,
+      labels = years_3
+    ) +
+    labs(
+      x = "Time period",
+      y = "MBIAS (deaths)",
+      title = "MBIAS (deaths) vs. time, by region"
+    ) +
+    theme(legend.position = "none")
+  
+  # Plot maps of MBIAS_b for all six time periods separately
+  for (i in 1:length(years_3)) {
+    print(
+      plot_map(
+        df = region_data %>%
+          filter(years==years_3[i] & n_births_vr!=0) %>%
+          subset(select=c(region,mbias_b)),
+        geo2 = geo2,
+        title = paste("MBIAS (births), years:",years_3[i]),
+        limits = c(0.5, 2.5),
+        midpoint = 1,
+        sfg = "rwg"
+      )
+    )
+  }
+  
+  # Plot maps of MBIAS_d for all six time periods separately
+  for (i in 1:length(years_3)) {
+    print(
+      plot_map(
+        df = region_data %>%
+          filter(years==years_3[i] & n_births_vr!=0) %>%
+          subset(select=c(region,mbias_d)),
+        geo2 = geo2,
+        title = paste("MBIAS (deaths), years:",years_3[i]),
+        limits = c(0.25, 5),
+        midpoint = 1,
+        sfg = "rwg"
+      )
+    )
+  }
   
 }
 

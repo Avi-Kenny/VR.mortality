@@ -8,7 +8,7 @@
 #' @param limits Limits for the color scale
 #' @return A ggplot2 map object
 
-plot_map <- function(df, geo2, title, limits=NULL, sfg="purple") {
+plot_map <- function(df, geo2, title, limits=NULL, midpoint=0, sfg="purple") {
   
   if (sfg=="purple") {
     sfg2 <- scale_fill_gradient(
@@ -22,7 +22,7 @@ plot_map <- function(df, geo2, title, limits=NULL, sfg="purple") {
       low = "#8F2E2E",
       mid = "#FFFFFF",
       high = "#2E8F44",
-      midpoint = 0,
+      midpoint = midpoint,
       limits = limits
     )
   }
